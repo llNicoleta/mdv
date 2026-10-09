@@ -1,0 +1,523 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+const { execFileSync, spawn } = require('child_process');
+
+const USAGE = `usage: mdv [-w] [-b browser] file.md
+
+  -w, --watch          serve the file locally and re-render it on every save
+  -b, --browser NAME   open in this browser instead of the system default
+                       (safari, chrome, firefox, edge, brave, arc, or any app name)
+  -h, --help           show this help
+
+Diagrams: drag to pan, pinch or ctrl/cmd + scroll to zoom, double-click to reset.
+Expanded view (button or "f" over a diagram): plain scroll zooms, Esc closes.`;
+
+const BROWSER_ALIASES = {
+  safari: 'Safari',
+  chrome: 'Google Chrome',
+  firefox: 'Firefox',
+  edge: 'Microsoft Edge',
+  brave: 'Brave Browser',
+  arc: 'Arc',
+};
+
+function fail(message) {
+  console.error(`mdv: ${message}`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const opts = { watch: false, browser: null, file: null };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '-h' || arg === '--help') {
+      console.log(USAGE);
+      process.exit(0);
+    } else if (arg === '-w' || arg === '--watch') {
+      opts.watch = true;
+    } else if (arg === '-b' || arg === '--browser') {
+      opts.browser = argv[++i];
+      if (!opts.browser) fail('--browser needs a value');
+    } else if (arg.startsWith('--browser=')) {
+      opts.browser = arg.slice('--browser='.length);
+    } else if (arg.startsWith('-') && arg !== '-') {
+      fail(`unknown option ${arg}\n\n${USAGE}`);
+    } else if (opts.file) {
+      fail('only one file at a time');
+    } else {
+      opts.file = arg;
+    }
+  }
+  if (!opts.file) fail(`no file given\n\n${USAGE}`);
+  return opts;
+}
+
+// `open file.html` would use whatever app owns .html, which is often an editor,
+// so the default browser is looked up from the https URL handler instead.
+function defaultBrowserBundleId() {
+  const plist = path.join(
+    os.homedir(),
+    'Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist',
+  );
+  try {
+    const json = execFileSync('plutil', ['-convert', 'json', '-o', '-', plist], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const handler = (JSON.parse(json).LSHandlers || []).find(
+      (h) => h.LSHandlerURLScheme === 'https',
+    );
+    if (handler && handler.LSHandlerRoleAll) return handler.LSHandlerRoleAll;
+  } catch {}
+  return 'com.apple.Safari';
+}
+
+function openInBrowser(target, browser) {
+  const args = browser
+    ? ['-a', BROWSER_ALIASES[browser.toLowerCase()] || browser, target]
+    : ['-b', defaultBrowserBundleId(), target];
+  const child = spawn('open', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => (stderr += chunk));
+  child.on('close', (code) => {
+    if (code !== 0) fail(`could not open browser: ${stderr.trim() || `open exited with ${code}`}`);
+  });
+}
+
+function embedJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+}
+
+function renderPage({ title, markdown, baseHref, live }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+${baseHref ? `<base href="${escapeHtml(baseHref)}">` : ''}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github.min.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --border: #d1d9e0;
+    --muted: #59636e;
+    --button-bg: #ffffff;
+    --button-hover: #eff2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --panel: #151b23;
+      --border: #3d444d;
+      --muted: #9198a1;
+      --button-bg: #212830;
+      --button-hover: #262c36;
+    }
+  }
+  html { background: var(--bg); }
+  body { margin: 0; background: var(--bg); }
+  .markdown-body {
+    box-sizing: border-box;
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 40px 32px 80px;
+  }
+  @media (max-width: 767px) { .markdown-body { padding: 16px; } }
+  .front-matter { margin-bottom: 24px; color: var(--muted); }
+  .front-matter summary { cursor: pointer; font-size: 13px; }
+  .front-matter pre { margin-top: 8px; }
+
+  .diagram {
+    position: relative;
+    margin: 0 0 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  .diagram pre.mermaid {
+    margin: 0;
+    padding: 16px;
+    background: transparent;
+    visibility: hidden;
+  }
+  .diagram.expanded pre.mermaid { box-sizing: border-box; height: 100%; }
+  .diagram.expanded svg { height: 100% !important; }
+  .diagram svg { display: block; cursor: grab; }
+  .diagram svg:active { cursor: grabbing; }
+  .diagram.expanded {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+  .diagram-tools {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    gap: 4px;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .diagram:hover .diagram-tools,
+  .diagram.expanded .diagram-tools,
+  .diagram-tools:focus-within { opacity: 1; }
+  .diagram-tools button {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--button-bg);
+    color: inherit;
+    font: 14px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    cursor: pointer;
+  }
+  .diagram-tools button:hover { background: var(--button-hover); }
+  .diagram-hint {
+    position: absolute;
+    left: 12px;
+    bottom: 10px;
+    font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--muted);
+    display: none;
+  }
+  .diagram.expanded .diagram-hint { display: block; }
+  body.has-expanded { overflow: hidden; }
+</style>
+</head>
+<body>
+<article id="content" class="markdown-body"></article>
+<script id="source" type="application/json">${embedJson(markdown)}</script>
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.2/dist/svg-pan-zoom.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
+<script>
+(() => {
+  const content = document.getElementById('content');
+  const dark = window.matchMedia('(prefers-color-scheme: dark)');
+  let panZooms = [];
+  let renderId = 0;
+
+  const escapeHtml = (text) =>
+    text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+  marked.use({
+    gfm: true,
+    renderer: {
+      code({ text, lang }) {
+        if ((lang || '').trim().toLowerCase() !== 'mermaid') return false;
+        return '<div class="diagram"><pre class="mermaid">' + escapeHtml(text) + '</pre></div>';
+      },
+    },
+  });
+
+  function splitFrontMatter(markdown) {
+    const match = markdown.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/);
+    if (!match) return { frontMatter: null, body: markdown };
+    return { frontMatter: match[1], body: markdown.slice(match[0].length) };
+  }
+
+  function diagramHeight(svg, width) {
+    const box = svg.viewBox.baseVal;
+    if (!box || !box.width || !box.height) return 400;
+    const scale = Math.min(1, width / box.width);
+    return Math.max(120, Math.min(box.height * scale, window.innerHeight * 0.75));
+  }
+
+  function refit(pz) {
+    pz.resize();
+    pz.fit();
+    pz.center();
+  }
+
+  function setExpanded(diagram, pz, expanded) {
+    diagram.classList.toggle('expanded', expanded);
+    document.body.classList.toggle('has-expanded', !!document.querySelector('.diagram.expanded'));
+    diagram.querySelector('[data-action="expand"]').textContent = expanded ? '\\u2715' : '\\u2922';
+    diagram.querySelector('[data-action="expand"]').title = expanded ? 'Close (Esc)' : 'Expand (f)';
+    requestAnimationFrame(() => refit(pz));
+  }
+
+  function attachPanZoom(diagram) {
+    const svg = diagram.querySelector('svg');
+    if (!svg) return;
+    diagram.querySelector('pre.mermaid').style.visibility = 'visible';
+
+    const height = diagramHeight(svg, diagram.clientWidth - 32);
+    svg.removeAttribute('height');
+    svg.setAttribute('width', '100%');
+    svg.style.maxWidth = 'none';
+    svg.style.width = '100%';
+    svg.style.height = height + 'px';
+
+    const pz = svgPanZoom(svg, {
+      zoomEnabled: true,
+      panEnabled: true,
+      mouseWheelZoomEnabled: false,
+      dblClickZoomEnabled: false,
+      controlIconsEnabled: false,
+      fit: true,
+      center: true,
+      minZoom: 0.1,
+      maxZoom: 50,
+    });
+    panZooms.push(pz);
+
+    const tools = document.createElement('div');
+    tools.className = 'diagram-tools';
+    tools.innerHTML =
+      '<button type="button" data-action="in" title="Zoom in">+</button>' +
+      '<button type="button" data-action="out" title="Zoom out">\\u2212</button>' +
+      '<button type="button" data-action="reset" title="Reset (double-click)">\\u21BA</button>' +
+      '<button type="button" data-action="expand" title="Expand (f)">\\u2922</button>';
+    diagram.appendChild(tools);
+
+    const hint = document.createElement('div');
+    hint.className = 'diagram-hint';
+    hint.textContent = 'Scroll or pinch to zoom \\u00B7 drag to pan \\u00B7 double-click to reset \\u00B7 Esc to close';
+    diagram.appendChild(hint);
+
+    tools.addEventListener('click', (event) => {
+      const action = event.target.closest('button')?.dataset.action;
+      if (action === 'in') pz.zoomBy(1.25);
+      if (action === 'out') pz.zoomBy(0.8);
+      if (action === 'reset') refit(pz);
+      if (action === 'expand') setExpanded(diagram, pz, !diagram.classList.contains('expanded'));
+    });
+
+    diagram.addEventListener('dblclick', (event) => {
+      if (!event.target.closest('.diagram-tools')) refit(pz);
+    });
+
+    const pointIn = (event) => {
+      const rect = svg.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+
+    diagram.addEventListener('wheel', (event) => {
+      const pinch = event.ctrlKey;
+      if (!pinch && !event.metaKey && !diagram.classList.contains('expanded')) return;
+      event.preventDefault();
+      const unit = event.deltaMode === 1 ? 16 : 1;
+      const factor = Math.exp(-event.deltaY * unit * (pinch ? 0.01 : 0.002));
+      pz.zoomAtPointBy(factor, pointIn(event));
+    }, { passive: false });
+
+    let lastScale = 1;
+    diagram.addEventListener('gesturestart', (event) => {
+      event.preventDefault();
+      lastScale = 1;
+    });
+    diagram.addEventListener('gesturechange', (event) => {
+      event.preventDefault();
+      pz.zoomAtPointBy(event.scale / lastScale, pointIn(event));
+      lastScale = event.scale;
+    });
+    diagram.addEventListener('gestureend', (event) => event.preventDefault());
+
+    diagram._panZoom = pz;
+  }
+
+  async function render(markdown) {
+    const id = ++renderId;
+    const scrollY = window.scrollY;
+    panZooms.forEach((pz) => pz.destroy());
+    panZooms = [];
+    document.body.classList.remove('has-expanded');
+
+    const { frontMatter, body } = splitFrontMatter(markdown);
+    let html = marked.parse(body);
+    if (frontMatter) {
+      html =
+        '<details class="front-matter"><summary>Front matter</summary><pre><code class="language-yaml">' +
+        escapeHtml(frontMatter) +
+        '</code></pre></details>' + html;
+    }
+    content.innerHTML = html;
+
+    content.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+
+    mermaid.initialize({ startOnLoad: false, theme: dark.matches ? 'dark' : 'default' });
+    await mermaid.run({ nodes: content.querySelectorAll('pre.mermaid'), suppressErrors: true });
+    if (id !== renderId) return;
+
+    content.querySelectorAll('.diagram').forEach(attachPanZoom);
+    window.scrollTo(0, scrollY);
+  }
+
+  let source = JSON.parse(document.getElementById('source').textContent);
+  render(source);
+  dark.addEventListener('change', () => render(source));
+
+  let hovered = null;
+  document.addEventListener('mouseover', (event) => {
+    hovered = event.target.closest?.('.diagram') || null;
+  });
+  document.addEventListener('keydown', (event) => {
+    const open = document.querySelector('.diagram.expanded');
+    if (event.key === 'Escape' && open) setExpanded(open, open._panZoom, false);
+    if (event.key === 'f' && !event.metaKey && !event.ctrlKey && !open && hovered?._panZoom) {
+      setExpanded(hovered, hovered._panZoom, true);
+    }
+  });
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => panZooms.forEach(refit), 150);
+  });
+
+  ${live ? `
+  const events = new EventSource('/__mdv/events');
+  events.addEventListener('update', (event) => {
+    source = JSON.parse(event.data);
+    render(source);
+  });
+  events.addEventListener('gone', () => {
+    content.insertAdjacentHTML('afterbegin', '<p><em>The file was deleted or moved.</em></p>');
+  });` : ''}
+})();
+</script>
+</body>
+</html>
+`;
+}
+
+function readMarkdown(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    fail(`cannot read ${file}: ${error.message}`);
+  }
+}
+
+function openOnce(file, browser) {
+  const markdown = readMarkdown(file);
+  const dir = path.join(os.tmpdir(), 'mdv');
+  fs.mkdirSync(dir, { recursive: true });
+  const hash = crypto.createHash('sha1').update(file).digest('hex').slice(0, 8);
+  const out = path.join(dir, `${path.basename(file, path.extname(file))}-${hash}.html`);
+  const baseHref = new URL(`file://${path.dirname(file)}/`).href;
+  fs.writeFileSync(out, renderPage({ title: path.basename(file), markdown, baseHref, live: false }));
+  openInBrowser(out, browser);
+}
+
+const MIME = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.pdf': 'application/pdf',
+  '.css': 'text/css',
+  '.js': 'text/javascript',
+  '.json': 'application/json',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
+};
+
+function serveWatching(file, browser) {
+  readMarkdown(file);
+  const root = path.dirname(file);
+  const clients = new Set();
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+
+    if (url.pathname === '/') {
+      const markdown = readMarkdown(file);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(renderPage({ title: path.basename(file), markdown, baseHref: null, live: true }));
+      return;
+    }
+
+    if (url.pathname === '/__mdv/events') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+      });
+      res.write(': connected\n\n');
+      clients.add(res);
+      req.on('close', () => clients.delete(res));
+      return;
+    }
+
+    const target = path.resolve(root, '.' + decodeURIComponent(url.pathname));
+    if (target !== root && !target.startsWith(root + path.sep)) {
+      res.writeHead(403).end();
+      return;
+    }
+    fs.readFile(target, (error, data) => {
+      if (error) {
+        res.writeHead(404).end();
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': MIME[path.extname(target).toLowerCase()] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+      });
+      res.end(data);
+    });
+  });
+
+  const broadcast = (event, data) => {
+    for (const client of clients) client.write(`event: ${event}\ndata: ${data}\n\n`);
+  };
+
+  // Polling survives editors that save by writing a new file and renaming it over the old one.
+  fs.watchFile(file, { interval: 250 }, (current) => {
+    if (current.nlink === 0 && current.mtimeMs === 0) {
+      broadcast('gone', '""');
+      return;
+    }
+    try {
+      broadcast('update', JSON.stringify(fs.readFileSync(file, 'utf8')));
+    } catch {}
+  });
+
+  setInterval(() => {
+    for (const client of clients) client.write(': ping\n\n');
+  }, 30000).unref();
+
+  server.listen(0, '127.0.0.1', () => {
+    const url = `http://127.0.0.1:${server.address().port}/`;
+    console.log(`mdv: watching ${path.basename(file)} at ${url} (Ctrl+C to stop)`);
+    openInBrowser(url, browser);
+  });
+
+  process.on('SIGINT', () => {
+    console.log('');
+    process.exit(0);
+  });
+}
+
+const opts = parseArgs(process.argv.slice(2));
+const file = path.resolve(opts.file);
+if (!fs.existsSync(file) || !fs.statSync(file).isFile()) fail(`no such file: ${opts.file}`);
+
+if (opts.watch) serveWatching(file, opts.browser);
+else openOnce(file, opts.browser);
